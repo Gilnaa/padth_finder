@@ -13,6 +13,21 @@ STATE_IN_PROCESS = 1
 STATE_FINALIZED = 2
 
 
+class PaddingDetails(object):
+    def __init__(self, prev_field, next_field):
+        self.prev_field = prev_field
+        self.next_field = next_field
+
+    def __repr__(self):
+        if self.next_field is None:
+            args = (self.prev_field[2], self.prev_field[0], self.prev_field[0] + self.prev_field[1].byte_size)
+            return "Trailing padding after member '%s', which spans %u:%u" % args
+
+        args = (self.prev_field[2], self.prev_field[0], self.prev_field[0] + self.prev_field[1].byte_size,
+                self.next_field[2], self.next_field[0])
+        return "Padding between '%s', which spans %u:%u, and '%s', which starts at %u" % args
+
+
 class Type(object):
     def __init__(self, die):
         self.source_object = die
@@ -36,6 +51,9 @@ class Type(object):
 
     def has_padding(self):
         return False
+
+    def get_padding_list(self):
+        return []
 
     def get_location(self):
         node = self.source_object
@@ -77,27 +95,50 @@ class Struct(Type):
             if c.tag not in ['DW_TAG_member', 'DW_TAG_inheritance']:
                 continue
 
+            member_offset = c.attributes['DW_AT_data_member_location'].value
             type_num = c.attributes['DW_AT_type'].value
-            self.members.append(type_num)
+            member_name = c.attributes['DW_AT_name'].value.decode('utf-8') if c.tag == 'DW_TAG_member' else '<base>'
+            self.members.append((member_offset, type_num, member_name))
 
     def do_finalize(self, types):
         new_members = []
 
-        for member in self.members:
-            types[member].finalize(types)
-            new_members.append(types[member])
+        for offset, type_num, member_name in self.members:
+            types[type_num].finalize(types)
+            new_members.append((offset, types[type_num], member_name))
 
         self.members = new_members
 
     def has_padding(self):
-        return self.byte_size != sum(map(lambda t: t.byte_size, self.members)) or \
-            any(map(lambda dm: dm.has_padding(), self.members))
+        return self.byte_size != sum(map(lambda dm: dm[1].byte_size, self.members)) or \
+            any(map(lambda dm: dm[1].has_padding(), self.members))
+
+    def get_padding_list(self):
+        pads = []
+        # Check for padding between fields
+        for i in range(len(self.members) - 1):
+            cur_offset, cur_type, _ = self.members[i]
+            next_offset, _, _ = self.members[i+1]
+            pad_size = next_offset - cur_offset - cur_type.byte_size
+
+            if pad_size > 0:
+                pads.append(PaddingDetails(self.members[i], self.members[i+1]))
+
+        last_member = self.members[-1]
+        trailing_pad_size = self.byte_size - (last_member[0] + last_member[1].byte_size)
+        if trailing_pad_size > 0:
+            pads.append(PaddingDetails(last_member, None))
+
+        return pads
+
+    def __str__(self):
+        return self.name
 
     def __repr__(self):
         if len(self.members) == 0:
             return self.name
 
-        return self.name + '(%s)' % ', '.join(map(str, self.members))
+        return self.name + '(%s)' % ', '.join(map(lambda m: str(m[1]), self.members))
 
 
 class Array(Type):
@@ -206,6 +247,8 @@ def main():
             for o, t in types.items():
                 if t.has_padding():
                     print("Found padded type '%s' at %s:%u" % (t, cu_name, t.source_object.attributes['DW_AT_decl_line'].value))
+                    for p in t.get_padding_list():
+                        print('\t%s' % p)
 
 
 if __name__ == '__main__':
